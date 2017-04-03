@@ -1,0 +1,620 @@
+######################
+###   Libraries:   ###
+######################
+library(stringr)
+library(plyr)
+library(dplyr)
+library(lubridate)
+library(reshape2)
+library(ggplot2)
+library(DescTools)
+library(tidyverse)
+library(ROCR)
+library(rpart)
+library(randomForest)
+library(caret)
+
+
+#########################
+###   Loading data:   ###
+#########################
+dataset <- read.csv("C:/Users/marcin.pruchnicki/Desktop/R/mck/lending-club-loan-data/loan.csv", h = T)
+
+
+
+##########################################
+###   First look at the loaded data:   ###
+##########################################
+head(dataset) #top 5 obs
+
+
+
+###########################################
+###   Target variable called DEFAULT:   ###
+###########################################
+default_status <- c("Charged Off", "Default", "Does not meet the credit policy. Status:Charged Off", "Late (31-120 days)")
+default_status
+dataset$default <- ifelse(dataset$loan_status %in% default_status, 1, 0)
+
+table(dataset$default) #dist of the target variable
+prop.table(table(dataset$default)) #dist of the target variable --> low share of default = 1, so we might need to perform oversampling
+
+
+
+###################################
+###   Basic data preparation:   ###
+###################################
+str(dataset) #data types
+summary(dataset) #basic stats
+
+
+drops <- c("emp_title", "url", "desc", "title", "zip_code", "addr_state", "mths_since_last_record", "issue_d",
+           "earliest_cr_line", "last_pymnt_d", "last_credit_pull_d", "next_pymnt_d", "verification_status_joint") #deleting nominal variables which have too many classes or NULLS
+dataset <- dataset[ ,!(names(dataset) %in% drops)]
+
+drops1 <- c("application_type", "policy_code", "pymnt_plan") #almost only one value
+dataset <- dataset[ ,!(names(dataset) %in% drops1)]
+
+
+#deleting variables with high proportion of NULLs:
+only_nulls <- sapply(dataset, function(x) {
+  cover <- 1 - sum(is.na(x)) / length(x)
+  cover < 0.8
+})
+dataset <- dataset[,only_nulls == FALSE]
+
+
+dataset$revol_util <- str_replace_all(dataset$revol_util, "[%]", "")
+dataset$revol_util <- as.numeric(dataset$revol_util)
+dataset$home_ownership <- factor(dataset$home_ownership)
+dataset$is_rent <- dataset$home_ownership=="RENT"
+
+
+
+
+
+########################
+###   Basic stats:   ###
+########################
+num_cols <- sapply(dataset, is.numeric)
+
+#Distributions of numeric variables:
+cor(dataset[,num_cols])
+str(dataset[,num_cols])
+
+#Distributions of numeric variables:
+dataset_long <- melt(dataset[,num_cols], id = "default")
+head(dataset_long)
+
+p <- ggplot(aes(x = value, group = default, colour = factor(default)), data = dataset_long)
+
+p + geom_density() + facet_wrap(~variable, scales="free")
+
+
+
+
+#####################################
+###   Variables transformation:   ###
+#####################################
+#Deleting variables with high multicollinearity with other variablesŁ
+dataset[, 'loan_amnt'] <- NULL
+dataset[, 'funded_amnt_inv'] <- NULL
+dataset[, 'out_prncp_inv'] <- NULL
+dataset[, 'total_pymnt_inv'] <- NULL
+dataset[, 'total_rec_inv'] <- NULL
+dataset[, 'collection_recovery_fee'] <- NULL
+dataset[, 'total_rec_prncp'] <- NULL
+
+
+
+#Categorical variables:
+factor_cols <- sapply(dataset, is.factor)
+str(dataset[, factor_cols])
+
+table(dataset$term)
+table(dataset$grade)
+table(dataset$sub_grade)
+table(dataset$emp_length)
+table(dataset$emp_length)
+table(dataset$home_ownership) #consolidate some classes
+table(dataset$verification_status) 
+table(dataset$purpose) #consolidate some classes
+table(dataset$initial_list_status)
+
+
+#Consolidations of classes:
+dataset$home_ownership_new <- dataset$home_ownership
+levels(dataset$home_ownership_new) <- list(MORTGAGE = c("MORTGAGE"),
+                                           RENT = c("RENT"),
+                                           OTHER = c("ANY", "NONE", "OTHER", "OWN")
+                                           )
+
+dataset$purpose_new <- dataset$purpose
+levels(dataset$purpose_new) <- list(credit_card = c("credit_card"),
+                                    debt_consolidation = c("debt_consolidation"),
+                                    small_business = c("small_business"),
+                                    other = c("car", "educational", "home_improvement", "house", "major_purchase", "medical", "moving", "other",
+                                              "renewable_energy", "vacation", "wedding")
+                                    )
+
+dataset$pub_rec <- ifelse(dataset$pub_rec >= 1, 1, 0)
+dataset$inq_last_6mths <- ifelse(dataset$inq_last_6mths >= 1, 1, 0)
+
+dataset[, 'home_ownership'] <- NULL
+dataset[, 'purpose'] <- NULL
+
+#We have a lot observations so I delete rows without full data:
+dataset <- dataset[complete.cases(dataset), ]
+
+
+
+
+###########################
+####   Undersampling:   ###
+###########################
+sample_ones <- dataset[ which(dataset$default == 1), ]
+sample_zeros <- dataset[ which(dataset$default == 0), ]
+sample_zeros <- sample_zeros[sample(1 : nrow(sample_zeros), nrow(sample_ones), replace = FALSE), ]
+
+dataset_new <- rbind(sample_ones, sample_zeros)
+dataset_new$sort <- sample.int(nrow(dataset_new))
+dataset_new <- dataset_new[order(dataset_new$sort), ]
+
+head(dataset_new)
+
+nrow(dataset_new)
+nrow(sample_ones)
+nrow(sample_zeros)
+
+
+#########################
+###   Dataset split   ###
+#########################
+split_data <- function(data_set, tr_fraction){
+  set.seed(1)
+  random_numbers <- sample.int(nrow(data_set))
+  quantiles <- quantile(random_numbers, probs = c(0, tr_fraction, 1))
+  split_labels <- cut(random_numbers, quantiles, include.lowest = T,
+                      labels = c("train", "valid"))
+  return(split(data_set, split_labels))
+}
+
+train <- split_data(dataset_new, 0.7)$train
+valid <- split_data(dataset_new, 0.7)$valid
+
+
+nrow(dataset_new) #checking number of rows in base dataset
+nrow(valid) #checking number of rows in valid sample
+nrow(train) #checking number of rows in test sample
+
+str(train)
+table(train$inq_last_6mths)
+
+
+##################
+###   Models   ###
+##################
+#Logistinc regressions:
+logit <- glm(factor(default) ~ funded_amnt + term + int_rate + installment + grade + emp_length + 
+               annual_inc + verification_status + dti + delinq_2yrs + inq_last_6mths + 
+               pub_rec + initial_list_status + out_prncp + total_rec_int + 
+               collections_12_mths_ex_med + acc_now_delinq + tot_coll_amt + tot_cur_bal + 
+               total_rev_hi_lim + factor(is_rent) + revol_util + total_acc + 
+               open_acc + purpose_new
+             ,data = train, family = binomial, na.action = na.omit)
+
+summary(logit) #a lot of nonsignificant variables
+
+logit_back <- step(logit, k = 2)
+summary(logit_back)
+
+
+pred_logit_full_t <- predict(logit, newdata = train, type = "response")
+model_logit_scores_t <- prediction(pred_logit_full_t, train$default)
+model_logit_AUC_t <- performance(model_logit_scores_t, "auc")
+model_logit_AUC_t@y.values
+
+pred_logit_full <- predict(logit, newdata = valid, type = "response")
+model_logit_scores <- prediction(pred_logit_full, valid$default)
+model_logit_AUC <- performance(model_logit_scores, "auc")
+model_logit_AUC@y.values
+
+
+
+
+
+
+pred_logit_back_t <- predict(logit_back, newdata = train, type = "response")
+model_logit_back_scores_t <- prediction(pred_logit_back_t, train$default)
+model_logit_back_AUC_t <- performance(model_logit_back_scores_t, "auc")
+model_logit_back_AUC_t@y.values
+
+pred_logit_back <- predict(logit_back, newdata = valid, type = "response")
+model_logit_back_scores <- prediction(pred_logit_back, valid$default)
+model_logit_back_AUC <- performance(model_logit_back_scores, "auc")
+model_logit_back_AUC@y.values
+
+
+
+#interpretacja współczynników przy zmiennych objaśniających:
+exp(coef(logit_back))
+
+#ROC curve:
+#Full logit:
+pred <- roc <- auc <- prediction.object <- list()
+pred[[1]] <- list(predict(logit, type = "response"), train$default)
+pred[[2]] <- list(predict(logit, new = valid, "response"), valid$default)
+
+
+  for (i in 1:length(pred)) {
+    prediction.object[[i]] <- prediction(pred[[i]][[1]],
+                                         pred[[i]][[2]])
+    roc[[i]] <- performance(prediction.object[[i]], "tpr", "fpr")
+    auc[[i]] <- performance(prediction.object[[i]], "auc")
+  }
+LEGEND_LABELS <- c("training", "validation")
+ShowCurve <- function(list, name, AUC = FALSE, legend.position = "right") {
+  for (i in 1:length(list)) {
+    plot(list[[i]], main = paste(name, "curve"),
+         col = i, lwd = 2, add = (i != 1), xlim = c(0, 1))
+    if (AUC) {
+      text(.9, 0.9 - i * 0.1, pos = 3, col = i, cex = .9,
+           paste("AUC=", round(auc[[i]]@y.values[[1]], digit = 2)))
+    }
+  }
+  legend(legend.position, lty = 1, lwd = 2, col = 1:4, y.intersp = 1,
+         legend = LEGEND_LABELS, seg.len = 0.5, bty = "n")
+}
+
+ShowCurve(roc, "ROC", AUC = TRUE)
+
+#Backward selection logit:
+pred <- roc <- auc <- prediction.object <- list()
+pred[[1]] <- list(predict(logit_back, type = "response"), train$default)
+pred[[2]] <- list(predict(logit_back, new = valid, "response"), valid$default)
+
+
+for (i in 1:length(pred)) {
+  prediction.object[[i]] <- prediction(pred[[i]][[1]],
+                                       pred[[i]][[2]])
+  roc[[i]] <- performance(prediction.object[[i]], "tpr", "fpr")
+  auc[[i]] <- performance(prediction.object[[i]], "auc")
+}
+LEGEND_LABELS <- c("training", "validation")
+ShowCurve <- function(list, name, AUC = FALSE, legend.position = "right") {
+  for (i in 1:length(list)) {
+    plot(list[[i]], main = paste(name, "curve"),
+         col = i, lwd = 2, add = (i != 1), xlim = c(0, 1))
+    if (AUC) {
+      text(.9, 0.9 - i * 0.1, pos = 3, col = i, cex = .9,
+           paste("AUC=", round(auc[[i]]@y.values[[1]], digit = 2)))
+    }
+  }
+  legend(legend.position, lty = 1, lwd = 2, col = 1:4, y.intersp = 1,
+         legend = LEGEND_LABELS, seg.len = 0.5, bty = "n")
+}
+
+ShowCurve(roc, "ROC", AUC = TRUE)
+
+
+
+
+
+#Decision Trees:
+tree <- rpart(factor(default) ~ funded_amnt + term + int_rate + installment + grade + emp_length + 
+                annual_inc + verification_status + dti + delinq_2yrs + inq_last_6mths + 
+                pub_rec + initial_list_status + out_prncp + total_rec_int + last_pymnt_amnt + 
+                collections_12_mths_ex_med + acc_now_delinq + tot_coll_amt + tot_cur_bal + 
+                total_rev_hi_lim + factor(is_rent) + revol_util + revol_bal + total_acc + 
+                open_acc + purpose_new 
+              ,data=train, method="class", cp = 0)
+
+pred_tree_t <- predict(tree, train, type = "prob")
+model_tree_scores_t <- prediction(pred_tree_t[,2], train$default)
+model_tree_AUC_t <- performance(model_tree_scores_t, "auc")
+model_tree_AUC_t@y.values
+
+pred_tree <- predict(tree, valid, type = "prob")
+model_tree_scores <- prediction(pred_tree[,2], valid$default)
+model_tree_AUC <- performance(model_tree_scores, "auc")
+model_tree_AUC@y.values
+
+#ROC curve:
+pred <- roc <- auc <- prediction.object <- list()
+pred[[1]] <- list(predict(tree, type = "prob")[,2], train$default)
+pred[[2]] <- list(predict(tree, new = valid, "prob")[,2], valid$default)
+
+pred[[1]][[1]]
+
+for (i in 1:length(pred)) {
+  prediction.object[[i]] <- prediction(pred[[i]][[1]],
+                                       pred[[i]][[2]])
+  roc[[i]] <- performance(prediction.object[[i]], "tpr", "fpr")
+  auc[[i]] <- performance(prediction.object[[i]], "auc")
+}
+LEGEND_LABELS <- c("training", "validation")
+ShowCurve <- function(list, name, AUC = FALSE, legend.position = "right") {
+  for (i in 1:length(list)) {
+    plot(list[[i]], main = paste(name, "curve"),
+         col = i, lwd = 2, add = (i != 1), xlim = c(0, 1))
+    if (AUC) {
+      text(.9, 0.9 - i * 0.1, pos = 3, col = i, cex = .9,
+           paste("AUC=", round(auc[[i]]@y.values[[1]], digit = 2)))
+    }
+  }
+  legend(legend.position, lty = 1, lwd = 2, col = 1:4, y.intersp = 1,
+         legend = LEGEND_LABELS, seg.len = 0.5, bty = "n")
+}
+
+ShowCurve(roc, "ROC", AUC = TRUE)
+
+
+#Pruning:
+minimum.error <- which.min(tree$cptable[, "xerror"])
+optimal.complexity <- tree$cptable[minimum.error, "CP"]
+
+pruned_tree <- prune(tree, cp = optimal.complexity)
+
+pred_pruned_tree_t <- predict(pruned_tree, train, type = "prob")
+model_pruned_tree_scores_t <- prediction(pred_pruned_tree_t[,2], train$default)
+model_pruned_tree_AUC_t <- performance(model_pruned_tree_scores_t, "auc")
+model_pruned_tree_AUC_t@y.values
+
+pred_pruned_tree <- predict(pruned_tree, valid, type = "prob")
+model_pruned_tree_scores <- prediction(pred_pruned_tree[,2], valid$default)
+model_pruned_tree_AUC <- performance(model_pruned_tree_scores, "auc")
+model_pruned_tree_AUC@y.values
+
+
+
+#ROC curve:
+pred <- roc <- auc <- prediction.object <- list()
+pred[[1]] <- list(predict(pruned_tree, type = "prob")[,2], train$default)
+pred[[2]] <- list(predict(pruned_tree, new = valid, "prob")[,2], valid$default)
+
+
+
+for (i in 1:length(pred)) {
+  prediction.object[[i]] <- prediction(pred[[i]][[1]],
+                                       pred[[i]][[2]])
+  roc[[i]] <- performance(prediction.object[[i]], "tpr", "fpr")
+  auc[[i]] <- performance(prediction.object[[i]], "auc")
+}
+LEGEND_LABELS <- c("training", "validation")
+ShowCurve <- function(list, name, AUC = FALSE, legend.position = "right") {
+  for (i in 1:length(list)) {
+    plot(list[[i]], main = paste(name, "curve"),
+         col = i, lwd = 2, add = (i != 1), xlim = c(0, 1))
+    if (AUC) {
+      text(.9, 0.9 - i * 0.1, pos = 3, col = i, cex = .9,
+           paste("AUC=", round(auc[[i]]@y.values[[1]], digit = 2)))
+    }
+  }
+  legend(legend.position, lty = 1, lwd = 2, col = 1:4, y.intersp = 1,
+         legend = LEGEND_LABELS, seg.len = 0.5, bty = "n")
+}
+
+ShowCurve(roc, "ROC", AUC = TRUE)
+
+
+
+#Random forest:
+rf <- randomForest(factor(default) ~ funded_amnt + term + int_rate + installment + grade + emp_length + 
+                     annual_inc + verification_status + dti + delinq_2yrs + inq_last_6mths + 
+                     pub_rec + initial_list_status + out_prncp + total_rec_int + last_pymnt_amnt + 
+                     collections_12_mths_ex_med + acc_now_delinq + tot_coll_amt + tot_cur_bal + 
+                     total_rev_hi_lim + is_rent + revol_util + revol_bal + total_acc + 
+                     open_acc + purpose_new
+                   , data=train, importance=TRUE, na.action=na.omit)
+
+pred_rf_t <- predict(rf, newdata = train, type = "prob")
+model_rf_scores_t <- prediction(pred_rf_t[, 2], train$default)
+model_rf_AUC_t <- performance(model_rf_scores_t, "auc")
+model_rf_AUC_t@y.values
+
+
+pred_rf <- predict(rf, newdata = valid, type = "prob")
+model_rf_scores <- prediction(pred_rf[, 2], valid$default)
+model_rf_AUC <- performance(model_rf_scores, "auc")
+model_rf_AUC@y.values
+
+#ROC curve:
+pred <- roc <- auc <- prediction.object <- list()
+pred[[1]] <- list(predict(rf, type = "prob")[, 2], train$default)
+pred[[2]] <- list(predict(rf, new = valid, "prob")[, 2], valid$default)
+
+
+for (i in 1:length(pred)) {
+  prediction.object[[i]] <- prediction(pred[[i]][[1]],
+                                       pred[[i]][[2]])
+  roc[[i]] <- performance(prediction.object[[i]], "tpr", "fpr")
+  auc[[i]] <- performance(prediction.object[[i]], "auc")
+}
+LEGEND_LABELS <- c("training", "validation")
+ShowCurve <- function(list, name, AUC = FALSE, legend.position = "right") {
+  for (i in 1:length(list)) {
+    plot(list[[i]], main = paste(name, "curve"),
+         col = i, lwd = 2, add = (i != 1), xlim = c(0, 1))
+    if (AUC) {
+      text(.9, 0.9 - i * 0.1, pos = 3, col = i, cex = .9,
+           paste("AUC=", round(auc[[i]]@y.values[[1]], digit = 2)))
+    }
+  }
+  legend(legend.position, lty = 1, lwd = 2, col = 1:4, y.intersp = 1,
+         legend = LEGEND_LABELS, seg.len = 0.5, bty = "n")
+}
+
+ShowCurve(roc, "ROC", AUC = TRUE)
+
+
+
+
+#Neural network:
+library(nnet)
+
+NEURONS <- 2
+DECAYS <- seq(0, 50, length.out = 200)
+wts.parameter <-  2 * runif((NEURONS * 31) + NEURONS + 1) - 1
+train.error <- valid.error <- numeric(length(DECAYS))
+neural.nets <- list()
+progress.bar <- winProgressBar("Postep w %", "0% zrobione", 0, 1, 0)
+
+for (d in 1:length(DECAYS)){
+  neural.nets[[d]] <- nnet(default ~ funded_amnt + term + int_rate + installment + grade + emp_length + 
+                             annual_inc + verification_status + dti + delinq_2yrs + inq_last_6mths + 
+                             pub_rec + initial_list_status + out_prncp + total_rec_int + last_pymnt_amnt + 
+                             collections_12_mths_ex_med + acc_now_delinq + tot_coll_amt + tot_cur_bal + 
+                             total_rev_hi_lim + is_rent + revol_util + revol_bal + total_acc + 
+                             open_acc + purpose_new
+                           ,data = train
+                           ,size = NEURONS
+                           ,decay = DECAYS[d]
+                           ,linout = T
+                           ,maxit = 100
+                           ,trace = FALSE)
+  train.error[d] <- mean(neural.nets[[d]]$residuals ^ 2)
+  prediction <- predict(neural.nets[[d]], newdata = valid)
+  valid.error[d] <- mean((prediction - valid$default) ^ 2)
+  percentage <- d / length(DECAYS)
+  setWinProgressBar(progress.bar, percentage, "Postep w %",
+                    sprintf("%d%% zrobione", round(100 * percentage)))
+}
+close(progress.bar)
+
+best.neural.net.best <- neural.nets[[which.min(valid.error)]]
+prediction.best <- predict(best.neural.net.best, newdata = valid)
+MSE.best.net.best <- sum((prediction.best - valid$default)^2)/nrow(valid)
+MSE.best.net.best
+
+neural.best.scores <- prediction(prediction.best, valid$default)
+neural.best.AUC <- performance(neural.best.scores, "auc")
+neural.best.AUC@y.values
+
+#ROC curve:
+pred <- roc <- auc <- prediction.object <- list()
+pred[[1]] <- list(predict(best.neural.net.best, train), train$default)
+pred[[2]] <- list(predict(best.neural.net.best, new = valid), valid$default)
+
+
+for (i in 1:length(pred)) {
+  prediction.object[[i]] <- prediction(pred[[i]][[1]],
+                                       pred[[i]][[2]])
+  roc[[i]] <- performance(prediction.object[[i]], "tpr", "fpr")
+  auc[[i]] <- performance(prediction.object[[i]], "auc")
+}
+LEGEND_LABELS <- c("training", "validation")
+ShowCurve <- function(list, name, AUC = FALSE, legend.position = "right") {
+  for (i in 1:length(list)) {
+    plot(list[[i]], main = paste(name, "curve"),
+         col = i, lwd = 2, add = (i != 1), xlim = c(0, 1))
+    if (AUC) {
+      text(.9, 0.9 - i * 0.1, pos = 3, col = i, cex = .9,
+           paste("AUC=", round(auc[[i]]@y.values[[1]], digit = 2)))
+    }
+  }
+  legend(legend.position, lty = 1, lwd = 2, col = 1:4, y.intersp = 1,
+         legend = LEGEND_LABELS, seg.len = 0.5, bty = "n")
+}
+
+ShowCurve(roc, "ROC", AUC = TRUE)
+
+
+
+
+
+
+#Gradient boosting:
+fitControl <- trainControl(method = "cv", number = 2, repeats = 2)
+
+gbm <- train(as.factor(default) ~ funded_amnt + term + int_rate + installment + grade + emp_length + 
+                   annual_inc + verification_status + dti + delinq_2yrs + inq_last_6mths + 
+                   pub_rec + initial_list_status + out_prncp + total_rec_int + last_pymnt_amnt + 
+                   collections_12_mths_ex_med + acc_now_delinq + tot_coll_amt + tot_cur_bal + 
+                   total_rev_hi_lim + is_rent + revol_util + revol_bal + total_acc + 
+                   open_acc + purpose_new
+                 ,data = train
+                 ,method = "gbm"
+                 ,trControl = fitControl
+                 ,verbose = FALSE
+                 ,na.action=na.omit)
+
+summary(gbm)
+print(gbm)
+
+pred_gbm_t <- predict(gbm, train, type= "prob") 
+model_gbm_scores_t <- prediction(pred_gbm_t[,2], train$default)
+model_gbm_AUC_t <- performance(model_gbm_scores_t, "auc")
+model_gbm_AUC_t@y.values
+
+pred_gbm <- predict(gbm, valid, type= "prob") 
+model_gbm_scores <- prediction(pred_gbm[,2], valid$default)
+model_gbm_AUC <- performance(model_gbm_scores, "auc")
+model_gbm_AUC@y.values
+
+#ROC curve:
+pred <- roc <- auc <- prediction.object <- list()
+pred[[1]] <- list(predict(gbm, train, type = "prob")[, 2], train$default)
+pred[[2]] <- list(predict(gbm, new = valid, "prob")[, 2], valid$default)
+
+
+for (i in 1:length(pred)) {
+  prediction.object[[i]] <- prediction(pred[[i]][[1]],
+                                       pred[[i]][[2]])
+  roc[[i]] <- performance(prediction.object[[i]], "tpr", "fpr")
+  auc[[i]] <- performance(prediction.object[[i]], "auc")
+}
+LEGEND_LABELS <- c("training", "validation")
+ShowCurve <- function(list, name, AUC = FALSE, legend.position = "right") {
+  for (i in 1:length(list)) {
+    plot(list[[i]], main = paste(name, "curve"),
+         col = i, lwd = 2, add = (i != 1), xlim = c(0, 1))
+    if (AUC) {
+      text(.9, 0.9 - i * 0.1, pos = 3, col = i, cex = .9,
+           paste("AUC=", round(auc[[i]]@y.values[[1]], digit = 2)))
+    }
+  }
+  legend(legend.position, lty = 1, lwd = 2, col = 1:4, y.intersp = 1,
+         legend = LEGEND_LABELS, seg.len = 0.5, bty = "n")
+}
+
+ShowCurve(roc, "ROC", AUC = TRUE)
+
+
+#share of defaults in scorebands:
+test <- as.data.frame(cbind(pred_gbm[,2], valid$default))
+head(test)
+colnames(test) <- c("pred_gbm", "original_default")
+
+test$score_band <- "0.9-1"
+test$score_band[test$pred_gbm <= 0.9 & test$pred_gbm > 0.8] <- "0.8-0.9"
+test$score_band[test$pred_gbm <= 0.8 & test$pred_gbm > 0.7] <- "0.7-0.8"
+test$score_band[test$pred_gbm <= 0.7 & test$pred_gbm > 0.6] <- "0.6-0.7"
+test$score_band[test$pred_gbm <= 0.6 & test$pred_gbm > 0.5] <- "0.5-0.6"
+test$score_band[test$pred_gbm <= 0.5 & test$pred_gbm > 0.4] <- "0.4-0.5"
+test$score_band[test$pred_gbm <= 0.4 & test$pred_gbm > 0.3] <- "0.3-0.4"
+test$score_band[test$pred_gbm <= 0.3 & test$pred_gbm > 0.2] <- "0.2-0.3"
+test$score_band[test$pred_gbm <= 0.2 & test$pred_gbm > 0.1] <- "0.1-0.2"
+test$score_band[test$pred_gbm <= 0.1 & test$pred_gbm > 0] <- "0-0.1"
+
+
+grouping <- ddply(test, .(score_band), function(x) {
+  c("bad_rate" = sum(x$original_default) / nrow(x),
+    "loans_cnt" = nrow(x))
+})
+
+grouping
+
+library(plotly)
+p <- plot_ly(
+  x = c("0-0.1", "0.1-0.2", "0.2-0.3", "0.3-0.4", "0.4-05", "0.5-0.6", "0.6-0.7", "0.7-0.8", "0.8-0.9", "0.9-1"),
+  y = grouping$bad_rate,
+  name = "Bad rate",
+  type = "bar") %>%
+  layout(title = "Bad rate")
+p
+
+
+pred_gbm1 <- predict(gbm, valid, type= "raw") 
+conf.matrix <- table(valid$default, pred_gbm[,2])
+accuracy <- (conf.matrix[1, 1] + conf.matrix[2, 2]) / nrow(valid)
+accuracy
